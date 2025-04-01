@@ -1,0 +1,544 @@
+---
+title: "stm"
+author: "Ryan Yeung"
+date: '2024-12-11'
+format:
+  html:
+    toc: true
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    code-block-bg: true
+    code-link: true
+    theme: flatly
+    df-print: paged
+    embed-resources: true
+    self-contained: true
+---
+
+## Structural Topic Models (STM)
+
+```{r setup}
+if (!require("pacman")) {
+  install.packages("pacman")
+}
+
+pacman::p_load(
+  ### uncomment the following line if data are in an excel sheet
+  # readxl,
+  tidyverse, gtsummary, janitor,
+  stm,
+  ### for textProcessor()
+  tm, SnowballC,
+  ### for K = 0 in stm()
+  Rtsne, rsvd, geometry,
+  ### for bonus preprocessing
+  udpipe, quanteda, quanteda.textstats,
+  kableExtra, pander
+)
+```
+
+## Data Prep
+
+::: {.panel-tabset}
+
+### Import
+
+```{r import}
+df_raw <-
+  read_csv("../input/dreaddit-train.csv")
+  ### run the following line instead if data are in an excel sheet
+  # readxl::read_excel("file_name_here.xlsx")
+
+df_raw %>%
+  head(10)
+```
+
+### Preprocessing
+
+```{r preprocessing}
+processed <- textProcessor(df_raw$text, metadata = df_raw)
+out <- prepDocuments(processed$documents, processed$vocab, processed$meta)
+
+summary(out)
+```
+
+:::
+
+## Run Basic Model
+
+::: {.panel-tabset}
+
+### Set Up STM
+
+```{r stm setup}
+docs <- out$documents
+vocab <- out$vocab
+meta <- out$meta
+
+cat("Number of Documents: ", length(docs))
+summary(vocab)
+summary(meta)
+```
+
+### Basic STM
+
+```{r basic stm}
+topic_model <-
+  stm(
+    documents = out$documents,
+    vocab = out$vocab,
+    K = 0,
+    prevalence = ~subreddit + social_karma,
+    max.em.its = 75,
+    data = out$meta,
+    init.type = "Spectral",
+    seed = "111224"
+    )
+
+topic_model
+```
+
+```{r save basic topic model}
+saveRDS(topic_model, "../output/stm_basic.rds")
+```
+
+### SearchK
+
+```{r find k}
+findingk <- 
+  searchK(
+    documents = out$documents,
+    vocab = out$vocab,
+    K = c(20:30),
+    prevalence = ~subreddit + social_karma,
+    data = meta,
+    verbose = FALSE,
+    )
+```
+
+```{r findingk diagnostics}
+plot(findingk)
+
+findingk$results %>%
+  kable(
+    table.attr = "style = \"color: black;\"", 
+    caption = "summary statistics for simulated topic models"
+    ) %>% 
+  kableExtra::kable_styling(c("striped", "hover", "condensed")) %>%
+  kableExtra::scroll_box(width = "100%", height = "400px")
+```
+
+```{r findingk diagnostics ggplot}
+### plot diagnostic values for all possible Ks
+findingk$results %>% 
+  mutate(across(.cols = everything(), as.numeric)) %>% 
+  select(-bound, -em.its) %>% 
+  pivot_longer(., cols = -K, names_to = "metric", values_to = "value") %>% 
+  ggplot(aes(K, value, color = metric)) + 
+  geom_line(linewidth = 0.5, alpha = 0.7, show.legend = FALSE) +
+  geom_point(show.legend = FALSE) + 
+  facet_wrap(~metric, scales = "free") +
+  ggrepel::geom_text_repel(
+    aes(label = K),
+    show.legend = FALSE,
+    ) +
+  labs(
+    x = "K (Number of Topics)",
+    y = NULL,
+    ) + 
+  theme_classic()
+```
+
+:::
+
+## Inspect Basic Model
+
+```{r extract number of topics}
+n_topics <- 
+  topic_model$settings$dim$K %>% 
+  as.numeric()
+
+cat("Number of Topics: ", n_topics)
+```
+
+::: {.panel-tabset}
+
+### Topic Prevalence
+
+```{r topic prevalence}
+df_topic_prev <-
+  ### calculate mean thetas (proportion of document associated with a topic) across all documents
+  colMeans(topic_model$theta[, 1:n_topics]) %>% 
+  data.frame() %>% 
+  rename("prevalence" = ".") %>% 
+  mutate(
+    topic = paste0("Topic ", row_number()),
+    topic_num = row_number(),
+    prevalence = round(prevalence*100, 2),
+    ) %>%
+  relocate(topic)
+
+df_topic_prev
+
+### identify top 10 most prevalent topics
+top_n_prevalent_topics <- 
+  df_topic_prev %>% 
+  slice_max(prevalence, n = 20) %>% 
+  select(topic_num) %>% 
+  as.list() %>% 
+  unlist(use.names = FALSE)
+
+top_n_prevalent_topics
+```
+
+### Plot Topic Prevalence 
+
+```{r plot topic prevalence}
+plot(
+  topic_model, width = 30, text.cex = 0.7,
+  topics = top_n_prevalent_topics,
+  labeltype = "frex", n = 5,
+  main = "Topics by Prevalence and Top FREX Words"
+  )
+```
+
+### Label Topics
+
+```{r label topics}
+labelTopics(topic_model, top_n_prevalent_topics)
+```
+
+### Representative Documents
+
+```{r representative documents}
+df_rep_doc <-
+  data.frame()
+
+for (i in top_n_prevalent_topics) {
+  df <- 
+    findThoughts(
+      topic_model, 
+      texts = meta$text, 
+      topics = i,
+      n = 5,
+      )$docs[[1]] %>%
+    as.data.frame() %>%
+    mutate(topic_num = i) 
+  
+  df_rep_doc <-
+    bind_rows(df_rep_doc, df)
+}
+
+df_rep_doc <-
+  df_rep_doc %>% 
+  rename("text" = ".")
+
+df_rep_doc
+```
+
+:::
+
+## Inference
+
+::: {.panel-tabset}
+
+### Estimate Effect
+
+```{r estimate effect}
+topic_model_est <-
+  estimateEffect(
+    formula = top_n_prevalent_topics ~ subreddit + social_karma,
+    stmobj = topic_model,
+    metadata = out$meta,
+    uncertainty = "None"
+    )
+```
+
+### Extract Effects Table
+
+```{r extract estimate effects as table}
+topic_model_est_effects <- summary(topic_model_est)
+
+topic_model_est_effects_summary <- 
+  ### bind summary outputs together
+  do.call(rbind, topic_model_est_effects[[3]]) %>% 
+  as.data.frame()
+
+df_est_effects <-
+  topic_model_est_effects_summary %>% 
+  rownames_to_column(var = "predictor") %>% 
+  filter(!str_detect(predictor, "Intercept")) %>% 
+  janitor::clean_names()
+
+df_est_effects$topic_num <-
+  rep(top_n_prevalent_topics, each = 10)
+
+df_est_effects %>% 
+  select(-t_value) %>% 
+  filter(pr_t < .05)
+```
+
+### Plot Effects
+
+```{r}
+### topics significantly related to 
+for (i in c(34, 12, 1)) {
+  plot(
+    topic_model_est, covariate = "social_karma",
+    topics = i, main = paste0("Topic ", i),
+    model = topic_model, method = "continuous",
+    xlab = "Karma", linecol = "blue",
+    printlegend = FALSE
+    )
+}
+```
+
+```{r}
+### 58 seems related to symptoms or treatment ("symptom", "nightmar", "depress")
+### accordingly, related to both PTSD and anxiety subreddits
+plot(
+  topic_model_est, covariate = "subreddit",
+  topics = c(51),
+  model = topic_model, method = "pointestimate",
+  xlab = "Prevalence", linecol = "blue",
+  printlegend = FALSE
+  )
+```
+
+```{r}
+### 25 seems related to components of traumatic memory ("abus", "rememb", "memori")
+### accordingly, related to trauma/PTSD subreddits as opposed to anxiety
+plot(
+  topic_model_est, covariate = "subreddit",
+  topics = c(25),
+  model = topic_model, method = "pointestimate",
+  xlab = "Prevalence", linecol = "blue",
+  printlegend = FALSE
+  )
+```
+
+:::
+
+## Bonus: Better Preprocessing
+
+::: {.panel-tabset}
+
+### UDPipe
+
+```{r udpipe model}
+udmodel <- udpipe_load_model(file = "../input/english-gum-ud-2.5-191206.udpipe")
+udmodel
+```
+
+### Parse Text
+
+```{r parse text}
+df_parsed <-
+  udpipe_annotate(
+    object = udmodel,
+    x = df_raw$text,
+    doc_id = df_raw$id,
+    ) %>%
+  as.data.frame()
+
+df_parsed %>% 
+  head(50)
+```
+
+### Clean Parsed Text
+
+```{r clean parsed text}
+df_parsed <-
+  df_parsed %>% 
+  ### return doc_id to numeric (parsing converts to character)
+  mutate(doc_id = as.numeric(doc_id)) %>% 
+  ### remove punctuation, numbers, symbols
+  filter(!(upos == "PUNCT")) %>% 
+  filter(!(upos == "NUM")) %>% 
+  filter(!(upos == "SYM"))
+
+df_parsed %>% 
+  select(upos) %>% 
+  tbl_summary()
+
+selected_vars <-
+  c("subreddit", "social_karma") 
+
+### join text metadata from df_pivot (`selected_vars`) back onto parsed df
+df_parsed <- 
+  df_raw %>% 
+  ### select relevant metadata variables from text data CSV
+  select(id, any_of(selected_vars)) %>% 
+  mutate(doc_id = as.numeric(id)) %>% 
+  right_join(df_parsed, by = join_by("doc_id"))
+
+df_parsed %>% 
+  slice_sample(n = 50)
+```
+
+### Concatenate Lemmas
+
+```{r concat parsed lemmas}
+df_parsed_concat <- 
+  df_parsed %>% 
+  group_by(doc_id) %>% 
+  summarize(text_lemmas = paste(lemma, collapse = " ")) %>% 
+  ungroup() %>% 
+  rename("id" = "doc_id") %>% 
+  left_join(x = df_raw, y = ., by = "id")
+
+df_parsed_concat %>% 
+  select(id, text_lemmas, text) %>% 
+  head(20)
+```
+
+### Create Corpus & DFM
+
+```{r create corpus}
+df_corpus <-
+  df_parsed_concat %>% 
+  # as.data.frame() %>% 
+  corpus(
+    docid_field = "doc_id",
+    text_field = "text_lemmas",
+  )
+
+df_corpus %>% 
+  docvars() %>%
+  head(20)
+```
+
+```{r create dfm}
+df_dfm <-
+  df_corpus %>% 
+  tokens() %>% 
+  dfm()
+
+df_dfm
+```
+
+### Vocab Pruning
+
+```{r vocab pruning}
+df_dfm_freq <- textstat_frequency(df_dfm) # check high freq tokens for cutoffs
+
+### frequency head and tail
+df_dfm_freq %>%
+  arrange(desc(frequency)) %>% 
+  slice(1:50, (n()-49):n())
+
+### docfreq head and tail
+df_dfm_freq %>%
+  arrange(desc(docfreq)) %>% 
+  slice(1:50, (n()-49):n())
+
+### docfreq distribution
+df_dfm_freq %>% 
+  # filter(docfreq > 100) %>%
+  ggplot(aes(x = docfreq)) +
+  # geom_histogram(binwidth = 5)
+  geom_density() +
+  scale_x_continuous(limits = c(0, 600, 100), breaks = seq(0, 600, 100))
+
+tabyl(df_dfm_freq$docfreq) %>% 
+  mutate(percent = round(percent*100, 2)) %>% 
+  mutate(cumul_percent = cumsum(percent)) %>% 
+  kableExtra::kable(table.attr = "style = \"color: black;\"", caption = "Document Frequency") %>% 
+  kableExtra::kable_styling(c("striped", "hover", "condensed")) %>%
+  kableExtra::scroll_box(width = "100%", height = "400px")
+```
+
+```{r vocab pruning thresholds freq}
+### 3SD method seems somewhat conservative
+maxfreq_3SD <- 
+  round(mean(df_dfm_freq$frequency) + (3*sd(df_dfm_freq$frequency))) 
+
+minfreq_3SD <- 
+  round(mean(df_dfm_freq$frequency) - (3*sd(df_dfm_freq$frequency)))
+
+### some recommend min 1% doc frequency
+min1pctdocfreq <- round(ndoc(df_dfm)/100) 
+### max 99% doc frequency is also recommended
+max99pctdocfreq <- round(99*ndoc(df_dfm)/100) 
+
+### SD and percent freq thresholds in table
+minmaxfreq_df <- data.frame(minfreq_3SD, maxfreq_3SD, min1pctdocfreq, max99pctdocfreq)
+
+colnames(minmaxfreq_df) <- c("mean freq - 3 SDs", "mean freq + 3 SDs", "1% doc freq", "99% doc freq")
+
+pander::pandoc.table(
+  minmaxfreq_df, style = "rmarkdown",
+  caption = "mean ± 3SD freq versus 1% and 99% docfreq thresholds",
+  )
+```
+
+```{r trim dfm}
+### trim dfm based on minimum 0.5% docfreq (>=3) and maximum +3SD freq (>=811)
+df_dfm_trimmed <- dfm_trim(df_dfm, min_docfreq = 3, max_termfreq = 909, termfreq_type = "count")
+df_dfm_shape <- c(ndoc(df_dfm), nfeat(df_dfm))
+df_dfm_trimmed_shape <- c(ndoc(df_dfm_trimmed), nfeat(df_dfm_trimmed))
+df_dfm_prepost_trim_shape <- data.frame(rbind(df_dfm_shape, df_dfm_trimmed_shape))
+
+colnames(df_dfm_prepost_trim_shape) <- c("ndoc", "nfeat")
+
+pander::pander(
+  df_dfm_prepost_trim_shape, style = "rmarkdown",
+  caption = "DFM shape before and after vocab pruning (min doc freq >= 3, max term freq <= 909)"
+  )
+
+### recheck high freq tokens for cutoffs
+df_dfm_trimmed_freq <- textstat_frequency(df_dfm_trimmed) 
+
+### frequency head and tail
+df_dfm_trimmed_freq %>%
+  arrange(desc(frequency)) %>%
+  slice(1:50, (n()-49):n())
+
+### docfreq head and tail
+df_dfm_trimmed_freq %>%
+  arrange(desc(docfreq)) %>% 
+  slice(1:50, (n()-49):n())
+```
+
+### STM Setup
+
+```{r stm setup with trimmed}
+out <- convert(df_dfm_trimmed, to = "stm")
+
+documents <- out$documents
+vocab <- out$vocab
+meta <- out$meta
+
+cat("Number of Documents: ", length(docs))
+summary(vocab)
+summary(meta)
+```
+
+:::
+
+## Cleanup
+
+::: {.panel-tabset}
+
+### Save Model
+
+```{r save rdata, warning = F}
+rdata_file_name <- 
+  paste0(
+    "../stm_model/",
+    as.character(format(Sys.time(), '%F')), ### add "_%I-%M%p"for time
+    "_stm_basic.RData", sep = ""
+    )
+
+rdata_file_name
+save.image(file = rdata_file_name, safe = TRUE)
+```
+
+### Cite Packages
+
+```{r cite packages}
+report::cite_packages()
+```
+
+:::
